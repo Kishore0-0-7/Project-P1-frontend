@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import { Icon, type IconName } from './components/Icon';
 import { LoginPage } from './components/LoginPage';
+import { LogoutDialog } from './components/LogoutDialog';
 import { RecordDialog, type RecordKind } from './components/RecordDialog';
 import { api, clearAuthSession, getCurrentUser, isAuthenticated, onAuthExpired, ApiError } from './lib/api';
 import type {
@@ -101,7 +102,9 @@ export default function App() {
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
   const [mobileNavigation, setMobileNavigation] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [dialog, setDialog] = useState<RecordKind | null>(null);
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
 
   const notify = (message: string, tone: 'success' | 'info' = 'success') => setToast({ message, tone });
 
@@ -357,7 +360,7 @@ export default function App() {
     content = (
       <SettingsPage
         currentUser={currentUser}
-        onLogout={handleLogout}
+        onLogout={() => setShowLogoutConfirm(true)}
         onNotify={notify}
       />
     );
@@ -369,9 +372,11 @@ export default function App() {
         page={page}
         user={currentUser}
         mobileOpen={mobileNavigation}
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
         onClose={() => setMobileNavigation(false)}
         onNavigate={navigate}
-        onLogout={handleLogout}
+        onLogout={() => setShowLogoutConfirm(true)}
         onNotify={notify}
       />
 
@@ -382,7 +387,7 @@ export default function App() {
           loading={loading}
           onMenu={() => setMobileNavigation(true)}
           onRefresh={hydrate}
-          onLogout={handleLogout}
+          onLogout={() => setShowLogoutConfirm(true)}
           onNotify={() => notify('All background tasks synchronized with backend', 'info')}
         />
         {content}
@@ -453,6 +458,17 @@ export default function App() {
           {toast.message}
         </div>
       )}
+
+      {showLogoutConfirm && currentUser && (
+        <LogoutDialog
+          user={currentUser}
+          onClose={() => setShowLogoutConfirm(false)}
+          onConfirm={() => {
+            setShowLogoutConfirm(false);
+            void handleLogout();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -463,6 +479,8 @@ function Sidebar({
   page,
   user,
   mobileOpen,
+  collapsed,
+  onToggle,
   onClose,
   onNavigate,
   onLogout,
@@ -471,13 +489,13 @@ function Sidebar({
   page: PageId;
   user: AuthUser;
   mobileOpen: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
   onClose: () => void;
   onNavigate: (page: PageId) => void;
   onLogout: () => void;
   onNotify: (message: string, tone?: 'success' | 'info') => void;
 }) {
-  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-
   return (
     <>
       <button
@@ -485,7 +503,7 @@ function Sidebar({
         onClick={onClose}
         aria-label="Close navigation"
       />
-      <aside className={`sidebar ${mobileOpen ? 'is-open' : ''}`}>
+      <aside className={`sidebar ${mobileOpen ? 'is-open' : ''} ${collapsed ? 'is-collapsed' : ''}`}>
         <div className="brand">
           <div className="brand-mark">
             <Icon name="bolt" size={19} />
@@ -493,10 +511,14 @@ function Sidebar({
           <b>
             Ops<span>Triage</span>
           </b>
-          <button className="icon-button close-sidebar" onClick={onClose} aria-label="Close navigation">
+          <button className="icon-button mobile-close" onClick={onClose} aria-label="Close navigation">
             <Icon name="close" />
           </button>
         </div>
+        
+        <button className="desktop-toggle" onClick={onToggle} aria-label="Toggle navigation">
+          <Icon name="chevron-right" size={14} />
+        </button>
 
         <button
           className="workspace-switcher"
@@ -548,7 +570,7 @@ function Sidebar({
               <small style={{ color: '#94a3b8', fontSize: '10px', textTransform: 'capitalize' }}>{user.role} role</small>
             </div>
             <button
-              onClick={() => setShowLogoutConfirm(true)}
+              onClick={onLogout}
               className="icon-button"
               title="Sign Out"
               aria-label="Sign Out"
@@ -569,55 +591,6 @@ function Sidebar({
           </div>
         </div>
       </aside>
-
-      {showLogoutConfirm && (
-        <div
-          className="modal-layer"
-          role="presentation"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) setShowLogoutConfirm(false);
-          }}
-        >
-          <section className="record-dialog" role="dialog" aria-modal="true" style={{ maxWidth: '400px' }}>
-            <header>
-              <span>
-                <small>SECURITY &amp; SESSION</small>
-                <h2>Sign out of OpsTriage?</h2>
-                <p>You will be returned to the login screen and your active session will be invalidated.</p>
-              </span>
-              <button
-                type="button"
-                className="icon-button"
-                onClick={() => setShowLogoutConfirm(false)}
-                aria-label="Close dialog"
-              >
-                <Icon name="close" size={16} />
-              </button>
-            </header>
-            <footer>
-              <button
-                type="button"
-                className="button secondary"
-                onClick={() => setShowLogoutConfirm(false)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="button primary"
-                style={{ background: '#dc2626', borderColor: '#b91c1c', color: '#ffffff' }}
-                onClick={() => {
-                  setShowLogoutConfirm(false);
-                  onLogout();
-                }}
-              >
-                <Icon name="log-out" size={15} />
-                Sign Out
-              </button>
-            </footer>
-          </section>
-        </div>
-      )}
     </>
   );
 }
@@ -2954,19 +2927,27 @@ function Trend({
         </defs>
         <path d={areaPath} fill={`url(#trend-grad-${gradient})`} />
         <polyline points={polylinePoints} fill="none" stroke="currentColor" strokeWidth="1.8" vectorEffect="non-scaling-stroke" />
-        {coords.map((c, i) => (
-          <circle
-            key={i}
-            cx={c.x}
-            cy={c.y}
-            r={hoveredIdx === i ? 3 : 1.6}
-            fill="currentColor"
-            style={{ cursor: 'pointer', transition: 'r 0.15s ease' }}
-            onMouseEnter={() => setHoveredIdx(i)}
-            onMouseLeave={() => setHoveredIdx(null)}
-          />
-        ))}
       </svg>
+      {coords.map((c, i) => (
+        <div
+          key={i}
+          onMouseEnter={() => setHoveredIdx(i)}
+          onMouseLeave={() => setHoveredIdx(null)}
+          style={{
+            position: 'absolute',
+            left: `${c.x}%`,
+            top: `${c.y}%`,
+            width: hoveredIdx === i ? '8px' : '4px',
+            height: hoveredIdx === i ? '8px' : '4px',
+            background: 'currentColor',
+            borderRadius: '50%',
+            transform: 'translate(-50%, -50%)',
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+            zIndex: 5,
+          }}
+        />
+      ))}
       {hoveredIdx !== null && coords[hoveredIdx] && (
         <div
           style={{
