@@ -14,6 +14,7 @@ import type {
   Finding,
   HvacEvaluationResult,
   Incident,
+  IntakeTimelinePoint,
   Rule,
   Severity,
   SimulationResult,
@@ -564,9 +565,13 @@ export const api = {
     });
   },
 
-  // Reports
+  // Reports & Telemetry Timeline
   async getReports(days = 7): Promise<SlaReportData> {
     return request<SlaReportData>(`/reports${query({ days })}`);
+  },
+
+  async getIntakeTimeline(hours = 12): Promise<IntakeTimelinePoint[]> {
+    return request<IntakeTimelinePoint[]>(`/reports/timeline${query({ hours })}`);
   },
 
   // AI Diagnostics & Simulations

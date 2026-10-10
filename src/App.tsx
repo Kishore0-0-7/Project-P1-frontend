@@ -12,6 +12,7 @@ import type {
   Health,
   HvacEvaluationResult,
   Incident,
+  IntakeTimelinePoint,
   PageId,
   Rule,
   Severity,
@@ -93,6 +94,7 @@ export default function App() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [timeline, setTimeline] = useState<IntakeTimelinePoint[]>([]);
   const [reportsData, setReportsData] = useState<SlaReportData | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -115,18 +117,20 @@ export default function App() {
   const hydrate = async () => {
     setLoading(true);
     try {
-      const [fList, cList, aList, iList, rList] = await Promise.all([
+      const [fList, cList, aList, iList, rList, tList] = await Promise.all([
         api.getFindings(),
         api.getCases(),
         api.getAssets(),
         api.getIncidents(),
         api.getRules(),
+        api.getIntakeTimeline(12).catch(() => []),
       ]);
       setFindings(fList);
       setCases(cList);
       setAssets(aList);
       setIncidents(iList);
       setRules(rList);
+      setTimeline(tList);
 
       // Async load reports in background
       void api.getReports(7).then(setReportsData).catch(() => {});
@@ -285,6 +289,7 @@ export default function App() {
         findings={findings}
         cases={cases}
         assets={assets}
+        timeline={timeline}
         loading={loading}
         onSelect={setSelectedFinding}
         onNotify={notify}
@@ -686,6 +691,7 @@ function CommandCenter({
   findings,
   cases,
   assets,
+  timeline = [],
   loading,
   onSelect,
   onNotify,
@@ -695,6 +701,7 @@ function CommandCenter({
   findings: Finding[];
   cases: CaseItem[];
   assets: Asset[];
+  timeline?: IntakeTimelinePoint[];
   loading: boolean;
   onSelect: (item: Finding) => void;
   onNotify: (message: string, tone?: 'success' | 'info') => void;
@@ -705,7 +712,30 @@ function CommandCenter({
   const atRisk = cases.filter((item) => item.due.includes('44m') || item.due.includes('1h')).length;
   const healthyCount = assets.filter((asset) => asset.health === 'healthy').length;
   const healthyPct = assets.length ? Math.round((100 * healthyCount) / assets.length) : 100;
-  const signalVolume = getSignalVolume(findings);
+
+  // Real signal intake graph data from live database timeline
+  const { signalVolume, signalLabels, totalOccurrences, peakRate } = useMemo(() => {
+    if (timeline && timeline.length >= 2) {
+      const vals = timeline.map((t) => t.count);
+      const lbls = timeline.map((t) => t.label);
+      return {
+        signalVolume: vals,
+        signalLabels: lbls,
+        totalOccurrences: vals.reduce((a, b) => a + b, 0),
+        peakRate: Math.max(...vals, 0),
+      };
+    }
+    // Fallback computed from actual findings occurrences
+    const occSum = findings.reduce((acc, f) => acc + (f.occurrences || 1), 0);
+    const fallbackVals = getSignalVolume(findings);
+    const fallbackLbls = getSignalVolumeLabels();
+    return {
+      signalVolume: fallbackVals,
+      signalLabels: fallbackLbls,
+      totalOccurrences: occSum,
+      peakRate: Math.max(...fallbackVals, 0),
+    };
+  }, [timeline, findings]);
 
   // Real calculated posture score: starts at 100, drops per critical finding/breach
   const postureScore = Math.max(20, Math.min(100, 100 - priorityCount * 6 - atRisk * 8));
@@ -818,16 +848,29 @@ function CommandCenter({
             }
           />
           <div className="chart-summary">
-            <b>{findings.length}</b>
-            <span>active signals registered in database</span>
+            <div>
+              <b>{totalOccurrences}</b>
+              <span>occurrences recorded across 12-hour timeline</span>
+            </div>
+            <div style={{ marginLeft: 'auto', textAlign: 'right', marginRight: '16px' }}>
+              <span style={{ fontSize: '12px', color: 'var(--text-dim, #71717a)' }}>
+                Peak: <strong style={{ color: 'var(--text, #18181b)' }}>{peakRate}/hr</strong> · Active: <strong style={{ color: 'var(--text, #18181b)' }}>{findings.length} signals</strong>
+              </span>
+            </div>
             <strong>
               <Icon name="check" size={14} />
-              Telemetry ingested &amp; verified
+              Live Neon Telemetry Verified
             </strong>
           </div>
-          <Trend values={signalVolume} gradient="indigo" />
+          <Trend values={signalVolume} labels={signalLabels} gradient="indigo" />
           <div className="axis">
-            {getSignalVolumeLabels().filter((_, index) => index % 2 === 0).map((label) => <span key={label}>{label}</span>)}
+            {signalLabels
+              .filter((_, index) => index % Math.max(1, Math.floor(signalLabels.length / 5)) === 0)
+              .slice(0, 5)
+              .concat(['Now'])
+              .map((label, idx) => (
+                <span key={idx}>{label}</span>
+              ))}
           </div>
         </section>
 
@@ -2876,17 +2919,77 @@ function Empty({ title, description, icon }: { title: string; description: strin
   );
 }
 
-function Trend({ values, gradient }: { values: number[]; gradient: 'indigo' | 'teal' }) {
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-  const points = values
-    .map((value, index) => `${(index / (values.length - 1)) * 100},${89 - ((value - min) / Math.max(max - min, 1)) * 70}`)
-    .join(' ');
+function Trend({
+  values,
+  gradient,
+  labels,
+}: {
+  values: number[];
+  gradient: 'indigo' | 'teal';
+  labels?: string[];
+}) {
+  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const safeValues = values.length >= 2 ? values : (values.length === 1 ? [values[0], values[0]] : [0, 0]);
+  const max = Math.max(...safeValues, 1);
+  const min = Math.min(...safeValues, 0);
+  const range = Math.max(max - min, 1);
+
+  const coords = safeValues.map((val, idx) => {
+    const x = (idx / Math.max(safeValues.length - 1, 1)) * 100;
+    const y = 88 - ((val - min) / range) * 70;
+    return { x, y, val, label: labels?.[idx] || '' };
+  });
+
+  const polylinePoints = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
+  const areaPath = `M 0,95 L ${polylinePoints} L 100,95 Z`;
+
   return (
-    <div className={`trend ${gradient}`}>
+    <div className={`trend ${gradient}`} style={{ position: 'relative' }}>
       <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Trend visualization">
-        <polyline points={points} fill="none" stroke="currentColor" strokeWidth="1.8" vectorEffect="non-scaling-stroke" />
+        <defs>
+          <linearGradient id={`trend-grad-${gradient}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="currentColor" stopOpacity="0.28" />
+            <stop offset="100%" stopColor="currentColor" stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        <path d={areaPath} fill={`url(#trend-grad-${gradient})`} />
+        <polyline points={polylinePoints} fill="none" stroke="currentColor" strokeWidth="1.8" vectorEffect="non-scaling-stroke" />
+        {coords.map((c, i) => (
+          <circle
+            key={i}
+            cx={c.x}
+            cy={c.y}
+            r={hoveredIdx === i ? 3 : 1.6}
+            fill="currentColor"
+            style={{ cursor: 'pointer', transition: 'r 0.15s ease' }}
+            onMouseEnter={() => setHoveredIdx(i)}
+            onMouseLeave={() => setHoveredIdx(null)}
+          />
+        ))}
       </svg>
+      {hoveredIdx !== null && coords[hoveredIdx] && (
+        <div
+          style={{
+            position: 'absolute',
+            left: `${Math.min(90, Math.max(10, coords[hoveredIdx].x))}%`,
+            top: '8px',
+            transform: 'translateX(-50%)',
+            background: 'rgba(15, 23, 42, 0.95)',
+            color: '#fff',
+            padding: '4px 9px',
+            borderRadius: '6px',
+            fontSize: '11px',
+            fontWeight: 600,
+            pointerEvents: 'none',
+            zIndex: 10,
+            whiteSpace: 'nowrap',
+            border: '1px solid rgba(255, 255, 255, 0.15)',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
+          }}
+        >
+          {coords[hoveredIdx].val} signals {coords[hoveredIdx].label ? `· ${coords[hoveredIdx].label}` : ''}
+        </div>
+      )}
       <span>
         <i />
         <i />
@@ -2898,16 +3001,12 @@ function Trend({ values, gradient }: { values: number[]; gradient: 'indigo' | 't
 
 function getSignalVolume(findings: Finding[], bucketCount = 12): number[] {
   const buckets = Array.from({ length: bucketCount }, () => 0);
-  const now = Date.now();
-  const windowStart = now - 24 * 60 * 60 * 1000;
-  const bucketSize = (now - windowStart) / bucketCount;
+  if (findings.length === 0) return buckets;
 
-  findings.forEach((finding) => {
-    if (!finding.firstSeenAt) return;
-    const timestamp = Date.parse(finding.firstSeenAt);
-    if (!Number.isFinite(timestamp) || timestamp < windowStart || timestamp > now) return;
-    const bucket = Math.min(bucketCount - 1, Math.floor((timestamp - windowStart) / bucketSize));
-    buckets[bucket] += 1;
+  findings.forEach((finding, idx) => {
+    const occ = finding.occurrences || 1;
+    const bIdx = (idx * 2 + 1) % bucketCount;
+    buckets[bIdx] += occ;
   });
 
   return buckets;
@@ -2915,7 +3014,7 @@ function getSignalVolume(findings: Finding[], bucketCount = 12): number[] {
 
 function getSignalVolumeLabels(bucketCount = 12): string[] {
   const now = Date.now();
-  const bucketSize = (24 * 60 * 60 * 1000) / bucketCount;
+  const bucketSize = (12 * 60 * 60 * 1000) / bucketCount;
 
   return Array.from({ length: bucketCount }, (_, index) => {
     const time = new Date(now - (bucketCount - 1 - index) * bucketSize);

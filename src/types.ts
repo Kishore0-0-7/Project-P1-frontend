@@ -150,3 +150,10 @@ export interface SlaReportData {
     metrics: string[];
   }>;
 }
+
+export interface IntakeTimelinePoint {
+  timestamp: string;
+  label: string;
+  count: number;
+}
+
