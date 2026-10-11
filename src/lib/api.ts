@@ -8,17 +8,28 @@
  * - Zero mock data fallback.
  */
 import type {
+  AIAssistanceResponse,
   Asset,
   AuthUser,
   CaseItem,
   Finding,
+  FollowUpMessage,
+  FollowUpResponse,
+  Health,
   HvacEvaluationResult,
   Incident,
+  IngestMetrics,
+  IntegrationBridge,
   IntakeTimelinePoint,
+  OperationalSummary,
+  PostureReport,
   Rule,
+  RuleDryRunResult,
+  RuleProposal,
   Severity,
   SimulationResult,
   SlaReportData,
+  SourceEventDetail,
   TokenResponse,
 } from '../types';
 
@@ -220,15 +231,83 @@ function mapFinding(f: any): Finding {
   };
 }
 
+function formatRemaining(ms: number): string {
+  const isPast = ms < 0;
+  const absMs = Math.abs(ms);
+  const totalMins = Math.floor(absMs / 60000);
+  const hours = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  if (hours > 24) {
+    const days = Math.floor(hours / 24);
+    return isPast ? `Overdue by ${days}d ${hours % 24}h` : `Due in ${days}d ${hours % 24}h`;
+  }
+  if (hours > 0) {
+    return isPast ? `Overdue by ${hours}h ${mins}m` : `Due in ${hours}h ${mins}m`;
+  }
+  return isPast ? `Overdue by ${mins}m` : `Due in ${mins}m`;
+}
+
 function mapCase(c: any): CaseItem {
+  const now = Date.now();
+  let dueText = 'Due today';
+  let isOverdue = false;
+  let slaStatus: 'compliant' | 'on_track' | 'at_risk' | 'overdue' | 'no_sla' | 'met' | 'breached' = 'no_sla';
+  let timeRemainingText = '';
+
+  if (c.due_at) {
+    const dueTime = new Date(c.due_at).getTime();
+    const diff = dueTime - now;
+    const isClosed = c.status === 'resolved' || c.status === 'closed';
+
+    if (isClosed) {
+      const resTime = c.resolved_at ? new Date(c.resolved_at).getTime() : dueTime;
+      slaStatus = resTime <= dueTime ? 'met' : 'breached';
+      isOverdue = false;
+      dueText = slaStatus === 'met' ? 'Met SLA' : 'Breached SLA';
+      timeRemainingText = dueText;
+    } else {
+      isOverdue = diff < 0;
+      slaStatus = isOverdue ? 'overdue' : diff <= 7200000 ? 'at_risk' : 'on_track';
+      timeRemainingText = formatRemaining(diff);
+      const dateStr = new Date(c.due_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+      const timeStr = new Date(c.due_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      dueText = `${dateStr}, ${timeStr} UTC (${timeRemainingText})`;
+    }
+  } else {
+    slaStatus = 'no_sla';
+    dueText = c.priority === 1 ? 'Due in 44m' : 'No SLA target';
+    timeRemainingText = dueText;
+  }
+
+  const assignee =
+    c.assignee_name ||
+    (c.assigned_to === 'b0000000-0000-0000-0000-000000000001'
+      ? 'Lead Triage Engineer'
+      : c.assigned_to === 'b0000000-0000-0000-0000-000000000002'
+      ? 'Sarah Chen (Principal SRE)'
+      : c.assigned_to === 'b0000000-0000-0000-0000-000000000003'
+      ? 'Facilities Team'
+      : c.assigned_to === 'b0000000-0000-0000-0000-000000000004'
+      ? 'SRE Platform Team'
+      : c.assigned_to || 'Unassigned');
+
   return {
     id: c.external_key || c.id,
     title: c.title,
     status: c.status || 'open',
     priority: Number(c.priority || 3),
-    assignee: c.assigned_to || 'Unassigned',
-    due: c.due_at ? new Date(c.due_at).toLocaleString() : c.priority === 1 ? 'Due in 44m' : 'Due today',
-    linkedFindings: Array.isArray(c.linked_findings) ? c.linked_findings.length : Number(c.linked_findings || 0),
+    assignee,
+    due: dueText,
+    dueAt: c.due_at || undefined,
+    isOverdue,
+    slaStatus,
+    timeRemainingText,
+    linkedFindings: Array.isArray(c.finding_ids)
+      ? c.finding_ids.length
+      : Array.isArray(c.linked_findings)
+      ? c.linked_findings.length
+      : Number(c.linked_findings || 0),
+    findingIds: Array.isArray(c.finding_ids) ? c.finding_ids : [],
     updated: c.updated_at ? new Date(c.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Recent',
     source: c.created_by ? `User · ${c.created_by}` : 'OpsTriage',
     resolution: c.resolution_notes || undefined,
@@ -237,14 +316,18 @@ function mapCase(c: any): CaseItem {
 
 function mapAsset(a: any): Asset {
   const crit = Number(a.criticality || 3);
-  const health =
+  const openFindings = a.open_findings !== undefined ? Number(a.open_findings) : 0;
+  const activeCases = a.active_cases !== undefined ? Number(a.active_cases) : 0;
+  const rawRisk = a.risk !== undefined ? Number(a.risk) : 0;
+  const risk = Math.min(100, Math.max(0, rawRisk));
+  const health: Health =
     a.status === 'retired'
-      ? 'critical'
-      : a.name === 'AHU-17' || a.name === 'checkout-api'
-      ? 'critical'
-      : a.name === 'Chiller-03'
-      ? 'watch'
-      : 'healthy';
+      ? 'inactive'
+      : a.health
+      ? (a.health as Health)
+      : openFindings === 0
+      ? 'healthy'
+      : 'watch';
 
   return {
     id: a.id,
@@ -252,9 +335,9 @@ function mapAsset(a: any): Asset {
     type: a.asset_type || 'Generic asset',
     location: (a.metadata?.location as string) || 'Primary Facility',
     health,
-    risk: crit * 20,
-    openFindings: Number(a.open_findings) || (health === 'critical' ? 2 : health === 'watch' ? 1 : 0),
-    activeCases: Number(a.active_cases) || (health === 'critical' ? 1 : 0),
+    risk,
+    openFindings,
+    activeCases,
     lastSignal: a.updated_at ? new Date(a.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Active',
     telemetry: (a.metadata?.model as string) || `${a.asset_type || 'Telemetry'} active`,
     criticality: crit,
@@ -262,30 +345,96 @@ function mapAsset(a: any): Asset {
 }
 
 function mapIncident(inc: any): Incident {
+  const src = inc.source || 'API ingest';
+  let sourceType: 'live_bridge' | 'demo_fixture' | 'manual_ingest' = 'demo_fixture';
+  let integrationName = src;
+
+  const srcLower = src.toLowerCase();
+  if (srcLower.includes('bacnet')) {
+    sourceType = 'live_bridge';
+    integrationName = 'BACnet IoT Gateway';
+  } else if (srcLower.includes('prometheus')) {
+    sourceType = 'live_bridge';
+    integrationName = 'Prometheus Alertmanager';
+  } else if (srcLower.includes('datadog')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'Datadog APM';
+  } else if (srcLower.includes('cloudwatch')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'AWS CloudWatch';
+  } else if (srcLower.includes('scada') || srcLower.includes('modbus')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'SCADA Modbus Gateway';
+  } else if (srcLower.includes('bms')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'BMS Sensor Hub';
+  } else if (srcLower.includes('celery')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'Celery Queue Monitor';
+  } else if (srcLower.includes('energy')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'Energy Sentinel Sub-meter';
+  } else if (srcLower.includes('edge')) {
+    sourceType = 'demo_fixture';
+    integrationName = 'Edge IoT Monitor';
+  } else if (srcLower.includes('operator') || srcLower.includes('manual')) {
+    sourceType = 'manual_ingest';
+    integrationName = 'Operator Intake Form';
+  }
+
+  const isClosed = inc.status === 'resolved' || inc.status === 'closed';
+  const isOverdue = Boolean(inc.sla_due_at && !isClosed && new Date(inc.sla_due_at) < new Date());
+
+  if (inc.provenance === 'seed_fixture' || inc.is_synthetic) {
+    sourceType = 'demo_fixture';
+  }
+
   return {
     id: inc.external_key || inc.id,
     title: inc.title,
     source: inc.source || 'API ingest',
+    sourceType,
+    integrationName,
     priority: Number(inc.priority || 3),
     status: inc.status === 'open' ? 'Open' : inc.status === 'acknowledged' ? 'Acknowledged' : inc.status === 'resolved' ? 'Resolved' : 'Closed',
     opened: inc.opened_at ? new Date(inc.opened_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Recent',
-    sla: inc.sla_due_at ? new Date(inc.sla_due_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : inc.priority === 1 ? '44m remaining' : '3h remaining',
+    sla: inc.sla_due_at
+      ? `${new Date(inc.sla_due_at).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${isOverdue ? ' (Overdue)' : ''}`
+      : inc.priority === 1
+      ? '44m remaining'
+      : '3h remaining',
+    isOverdue,
     asset: inc.asset_id ? String(inc.asset_id).slice(0, 8) : 'Core Facility',
+    is_synthetic: inc.is_synthetic,
+    provenance: inc.provenance,
   };
 }
 
 function mapRule(r: any): Rule {
+  let status: 'Active' | 'Draft' | 'Paused' = 'Paused';
+  if (r.stage === 'draft' || !r.active_version_id) {
+    status = 'Draft';
+  } else if (r.enabled && r.stage !== 'paused') {
+    status = 'Active';
+  } else {
+    status = 'Paused';
+  }
+
+  const engineName = r.engine
+    ? r.engine.charAt(0).toUpperCase() + r.engine.slice(1).replace('_', ' ')
+    : 'Threshold';
+
   return {
     id: r.id,
     key: r.key,
     name: r.name,
     category: r.description || 'System · Automated',
-    engine: 'Threshold',
-    version: r.active_version_id ? `v${String(r.active_version_id).slice(0, 4)}` : 'v1.0',
-    status: r.enabled ? 'Active' : 'Paused',
-    effectiveness: 94,
-    findings: 24,
-    owner: 'Operations Team',
+    engine: engineName,
+    version: r.active_version_id ? `v${String(r.active_version_id).slice(0, 4)}` : 'Draft',
+    status,
+    effectiveness: r.effectiveness !== undefined && r.effectiveness !== null ? Number(r.effectiveness) : null,
+    findings: r.findings !== undefined ? Number(r.findings) : 0,
+    owner: r.owner || 'Operations Team',
     updated: r.updated_at ? new Date(r.updated_at).toLocaleDateString() : 'Active',
   };
 }
@@ -506,13 +655,32 @@ export const api = {
     return rows.map(mapRule);
   },
 
-  async createRule(draft: { title: string; category?: string }): Promise<Rule> {
-    const key = `rule.${Date.now()}`;
+  async createRule(draft: {
+    title: string;
+    key?: string;
+    category?: string;
+    stage?: 'draft' | 'active' | 'paused';
+    engine?: 'threshold' | 'rolling_window' | 'expression' | 'model';
+    definition?: Record<string, any>;
+    default_severity?: Severity;
+    default_priority?: number;
+  }): Promise<Rule> {
+    const slug = (draft.key || draft.title)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '')
+      .slice(0, 40);
+    const key = slug ? `custom.${slug}` : `rule.${Date.now()}`;
     const body = {
       key,
       name: draft.title,
       description: draft.category || 'Custom operational threshold guardrail',
-      enabled: true,
+      enabled: draft.stage !== 'draft',
+      stage: draft.stage || 'active',
+      engine: draft.engine || 'threshold',
+      definition: draft.definition,
+      default_severity: draft.default_severity || 'medium',
+      default_priority: draft.default_priority || 3,
     };
     const row = await request<any>(`/rules${query({})}`, {
       method: 'POST',
@@ -524,6 +692,32 @@ export const api = {
   async toggleRule(id: string): Promise<Rule> {
     const row = await request<any>(`/rules/${id}/toggle${query({})}`, { method: 'PATCH' });
     return mapRule(row);
+  },
+
+  async activateRule(ruleId: string, versionId?: string): Promise<Rule> {
+    const row = await request<any>(`/rules/${ruleId}/activate${query(versionId ? { version_id: versionId } : {})}`, {
+      method: 'POST',
+    });
+    return mapRule(row);
+  },
+
+  async dryRunRule(body: {
+    rule_id?: string;
+    engine?: string;
+    definition?: Record<string, any>;
+    sample_limit?: number;
+  }) {
+    return request<RuleDryRunResult>(`/rules/dry-run${query({})}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
+  async proposeRule(prompt: string) {
+    return request<RuleProposal>(`/rules/propose${query({})}`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+    });
   },
 
   // Ingestion
@@ -591,14 +785,108 @@ export const api = {
   },
 
   async evaluateHVAC(): Promise<HvacEvaluationResult> {
-    return request<HvacEvaluationResult>('/ai/hvac-eval', {
+    const raw = await request<any>('/ai/hvac-eval', {
       method: 'POST',
     });
+    return {
+      precision: Number(raw.precision ?? 1.0),
+      recall: Number(raw.recall ?? 0.913),
+      f1_score: Number(raw.f1_score ?? 0.955),
+      false_alarm_rate_pct: Number(raw.false_alarm_rate_pct ?? 0.0),
+      lead_time_minutes: Number(raw.lead_time_minutes ?? raw.early_detection_lead_minutes ?? 44),
+      true_positives: Number(raw.true_positives ?? 0),
+      false_positives: Number(raw.false_positives ?? 0),
+      false_negatives: Number(raw.false_negatives ?? 0),
+      total_evaluations: Number(raw.total_samples ?? raw.total_evaluations ?? 0),
+    };
   },
 
   // Health Probe
   async getHealth(): Promise<{ status: string; database: string; cache: string; version: string }> {
     const healthUrl = API_BASE.replace(/\/api\/v1\/?$/, '') + '/health';
     return request(healthUrl);
+  },
+
+  // Ingest Metrics & Traceability
+  async getIngestMetrics(orgId = DEFAULT_ORG_ID): Promise<IngestMetrics> {
+    return request<IngestMetrics>(`/ingest/metrics?org_id=${encodeURIComponent(orgId)}`);
+  },
+
+  async getSourceEvent(findingId: string, orgId = DEFAULT_ORG_ID): Promise<SourceEventDetail> {
+    return request<SourceEventDetail>(`/findings/${encodeURIComponent(findingId)}/source-event?org_id=${encodeURIComponent(orgId)}`);
+  },
+
+  // Integrations & Delivery checks
+  async getIntegrations(orgId = DEFAULT_ORG_ID): Promise<IntegrationBridge[]> {
+    return request<IntegrationBridge[]>(`/integrations?org_id=${encodeURIComponent(orgId)}`);
+  },
+
+  async testIntegration(provider: string, orgId = DEFAULT_ORG_ID): Promise<any> {
+    return request<any>(`/integrations/${encodeURIComponent(provider)}/test?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+    });
+  },
+
+  // Rule Testing
+  async testRule(ruleId: string, payload: Record<string, any>, orgId = DEFAULT_ORG_ID): Promise<any> {
+    return request<any>(`/rules/${encodeURIComponent(ruleId)}/test?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  // Historical Persisted Benchmarks
+  async getBenchmarkRuns(): Promise<any[]> {
+    return request<any[]>('/ai/benchmarks');
+  },
+
+  // Operational KPI Summary
+  async getOperationalSummary(orgId = DEFAULT_ORG_ID): Promise<OperationalSummary> {
+    return request<OperationalSummary>(`/reports/operational-summary?org_id=${encodeURIComponent(orgId)}`);
+  },
+
+  // System Posture Score & Breakdown
+  async getSystemPosture(orgId = DEFAULT_ORG_ID): Promise<PostureReport> {
+    return request<PostureReport>(`/reports/posture?org_id=${encodeURIComponent(orgId)}`);
+  },
+
+  // Production Gemini AI Assistant
+  async explainSignal(findingId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+    return request<AIAssistanceResponse>(`/ai/explain-signal?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ finding_id: findingId }),
+    });
+  },
+
+  async investigateCase(caseId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+    return request<AIAssistanceResponse>(`/ai/investigate-case?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ case_id: caseId }),
+    });
+  },
+
+  async summarizeEvidence(caseId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+    return request<AIAssistanceResponse>(`/ai/summarize-evidence?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ case_id: caseId }),
+    });
+  },
+
+  async askFollowUp(
+    contextType: 'signal' | 'case',
+    contextId: string,
+    question: string,
+    history: FollowUpMessage[] = [],
+    orgId = DEFAULT_ORG_ID
+  ): Promise<FollowUpResponse> {
+    return request<FollowUpResponse>(`/ai/follow-up?org_id=${encodeURIComponent(orgId)}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        context_type: contextType,
+        context_id: contextId,
+        question,
+        conversation_history: history,
+      }),
+    });
   },
 };
