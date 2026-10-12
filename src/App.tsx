@@ -7,7 +7,9 @@ import { PlatformTour } from './components/PlatformTour';
 import { HelpMenu } from './components/HelpMenu';
 import { ContextualHelp } from './components/ContextualHelp';
 import { AIAssistancePanel } from './components/AIAssistancePanel';
+import { SupportChat } from './components/SupportChat';
 import { api, clearAuthSession, getCurrentUser, isAuthenticated, onAuthExpired, ApiError } from './lib/api';
+import { parseCsvRecords } from './lib/ingestion';
 import type {
   AIAssistanceResponse,
   Asset,
@@ -95,6 +97,34 @@ function initialPage(): PageId {
   return path in pageTitle ? path : 'command-center';
 }
 
+function WorkspaceSkeleton({ pageName }: { pageName: string }) {
+  return (
+    <section className="page workspace-loading" aria-busy="true" aria-label={`Loading ${pageName}`}>
+      <div className="skeleton-heading" />
+      <div className="skeleton-heading-sub" />
+      <div className="workspace-skeleton-cards">
+        {[0, 1, 2, 3].map((item) => <div className="skeleton-card" key={item} />)}
+      </div>
+      <div className="skeleton-card workspace-skeleton-panel" />
+      <div className="workspace-skeleton-columns">
+        <div className="skeleton-card" /><div className="skeleton-card" />
+      </div>
+      <p role="status">Loading {pageName} data…</p>
+    </section>
+  );
+}
+
+function WorkspaceLoadError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <section className="page workspace-load-error" role="alert">
+      <Icon name="alert" size={22} />
+      <h2>Workspace data could not be loaded</h2>
+      <p>{message}</p>
+      <button className="button primary" type="button" onClick={onRetry}><Icon name="refresh" size={15} /> Retry loading</button>
+    </section>
+  );
+}
+
 export default function App() {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => getCurrentUser());
   const [page, setPage] = useState<PageId>(initialPage);
@@ -110,9 +140,15 @@ export default function App() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [timeline, setTimeline] = useState<IntakeTimelinePoint[]>([]);
   const [reportsData, setReportsData] = useState<SlaReportData | null>(null);
+  const [reportsTimeline, setReportsTimeline] = useState<IntakeTimelinePoint[]>([]);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [reportsLoaded, setReportsLoaded] = useState(false);
+  const [reportsAttempted, setReportsAttempted] = useState(false);
+  const [reportsError, setReportsError] = useState<string | null>(null);
   const [operationalSummary, setOperationalSummary] = useState<OperationalSummary | null>(null);
   const [systemPosture, setSystemPosture] = useState<PostureReport | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
   const [mobileNavigation, setMobileNavigation] = useState(false);
@@ -134,14 +170,31 @@ export default function App() {
   // Hydrate all data from live backend
   const hydrate = async () => {
     setLoading(true);
+    setLoadError(null);
+    setFindings([]);
+    setCases([]);
+    setAssets([]);
+    setIncidents([]);
+    setRules([]);
+    setTimeline([]);
+    setReportsTimeline([]);
+    setReportsData(null);
+    setReportsLoaded(false);
+    setReportsAttempted(false);
+    setReportsError(null);
+    setOperationalSummary(null);
+    setSystemPosture(null);
+    setSelectedFinding(null);
     try {
-      const [fList, cList, aList, iList, rList, tList] = await Promise.all([
+      const [fList, cList, aList, iList, rList, tList, summary, posture] = await Promise.all([
         api.getFindings(),
         api.getCases(),
         api.getAssets(),
         api.getIncidents(),
         api.getRules(),
-        api.getIntakeTimeline(12).catch(() => []),
+        api.getIntakeTimeline(12),
+        api.getOperationalSummary(),
+        api.getSystemPosture(),
       ]);
       setFindings(fList);
       setCases(cList);
@@ -149,13 +202,10 @@ export default function App() {
       setIncidents(iList);
       setRules(rList);
       setTimeline(tList);
-
-      // Async load reports, operational summary, and posture in background
-      void api.getReports(7).then(setReportsData).catch(() => {});
-      void api.getOperationalSummary().then(setOperationalSummary).catch(() => {});
-      void api.getSystemPosture().then(setSystemPosture).catch(() => {});
+      setOperationalSummary(summary);
+      setSystemPosture(posture);
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Error loading live data', 'info');
+      setLoadError(error instanceof Error ? error.message : 'Could not load live workspace data.');
     } finally {
       setLoading(false);
     }
@@ -183,6 +233,25 @@ export default function App() {
     window.addEventListener('hashchange', syncHash);
     return () => window.removeEventListener('hashchange', syncHash);
   }, []);
+
+  // Report analytics are comparatively expensive and are only needed on the
+  // Insights page. Defer them until that page is opened.
+  useEffect(() => {
+    if (!currentUser || loading || page !== 'reports' || reportsLoaded || reportsAttempted) return;
+    setReportsAttempted(true);
+    setReportsLoading(true);
+    setReportsError(null);
+    void Promise.all([api.getReports(7), api.getIntakeTimeline(168)])
+      .then(([report, trend]) => {
+        setReportsData(report);
+        setReportsTimeline(trend);
+        setReportsLoaded(true);
+      })
+      .catch((error) => {
+        setReportsError(error instanceof Error ? error.message : 'Unable to load Insights data.');
+      })
+      .finally(() => setReportsLoading(false));
+  }, [currentUser, loading, page, reportsAttempted, reportsLoaded]);
 
   // Toast timer
   useEffect(() => {
@@ -265,12 +334,12 @@ export default function App() {
     }
   };
 
-  const updateCase = async (id: string, update: Partial<CaseItem>) => {
+  const updateCase = async (id: string, update: Partial<CaseItem>): Promise<boolean> => {
     try {
       const updated = await api.updateCase(id, {
         status: update.status,
         priority: update.priority,
-        assigned_to: update.assignee,
+        assigned_to: update.assigneeId,
         resolution_notes: update.resolution,
       });
       setCases((items) => items.map((item) => (item.id === id ? { ...item, ...update, ...updated } : item)));
@@ -281,8 +350,10 @@ export default function App() {
         void api.getIntakeTimeline().then(setTimeline);
       }
       notify(`Case ${id} updated${update.status ? ` to ${update.status}` : ''}`);
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Case update failed', 'info');
+      return false;
     }
   };
 
@@ -415,6 +486,7 @@ export default function App() {
         incidents={incidents}
         assets={assets}
         reportsData={reportsData}
+        reportsTimeline={reportsTimeline}
         onNotify={notify}
       />
     );
@@ -458,7 +530,21 @@ export default function App() {
           onStartTour={() => setTourOpen(true)}
           onNavigate={navigate}
         />
-        {content}
+        {loading ? <WorkspaceSkeleton pageName={pageTitle[page]} /> : loadError ? (
+          <WorkspaceLoadError message={loadError} onRetry={() => void hydrate()} />
+        ) : page === 'reports' && reportsLoading ? (
+          <WorkspaceSkeleton pageName={pageTitle.reports} />
+        ) : page === 'reports' && reportsError ? (
+          <WorkspaceLoadError
+            message={reportsError}
+            onRetry={() => {
+              setReportsAttempted(false);
+              setReportsError(null);
+            }}
+          />
+        ) : page === 'reports' && !reportsLoaded ? (
+          <WorkspaceSkeleton pageName={pageTitle.reports} />
+        ) : content}
       </main>
 
       {selectedFinding && (
@@ -549,6 +635,7 @@ export default function App() {
         onClose={() => setTourOpen(false)}
         onNavigate={navigate}
       />
+      <SupportChat />
     </div>
   );
 }
@@ -725,7 +812,7 @@ function Topbar({
           <Icon name="refresh" />
         </button>
 
-        <HelpMenu onStartTour={onStartTour} onNavigate={onNavigate} />
+        <HelpMenu page={page} onStartTour={onStartTour} onNavigate={onNavigate} />
 
         <button className="icon-button notification" onClick={onNotify} aria-label="Notifications">
           <Icon name="bell" />
@@ -781,12 +868,12 @@ function CommandCenter({
   }, [timeline]);
 
   const handleTimeWindowChange = async (hrs: number) => {
-    setTimeWindow(hrs);
     try {
       const pts = await api.getIntakeTimeline(hrs);
       setWindowTimeline(pts);
-    } catch {
-      // keep fallback
+      setTimeWindow(hrs);
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not load the requested intake window.', 'info');
     }
   };
 
@@ -798,27 +885,41 @@ function CommandCenter({
     return Array.from(s).sort();
   }, [assets]);
 
+  const assetByIdOrName = useMemo(() => {
+    const index = new Map<string, Asset>();
+    assets.forEach((asset) => {
+      index.set(asset.id, asset);
+      index.set(asset.name, asset);
+    });
+    return index;
+  }, [assets]);
+
   const filteredFindings = useMemo(() => {
     return findings.filter((f) => {
       if (siteFilter !== 'all') {
-        const a = assets.find((asset) => asset.name === f.asset || asset.id === f.asset);
+        const a = assetByIdOrName.get(f.asset);
         if (a && a.location !== siteFilter) return false;
       }
       return true;
     });
-  }, [findings, assets, siteFilter]);
+  }, [findings, assetByIdOrName, siteFilter]);
 
   const priorityCount = summary?.critical_signals_count !== undefined && summary?.high_signals_count !== undefined
     ? summary.critical_signals_count + summary.high_signals_count
     : filteredFindings.filter((item) => item.priority <= 2 && item.status !== 'resolved').length;
   const overdueCases = summary?.active_overdue ?? cases.filter((c) => c.isOverdue || c.slaStatus === 'overdue').length;
   const atRiskCases = summary?.active_at_risk ?? cases.filter((c) => c.slaStatus === 'at_risk').length;
-  const slaCompliancePct = summary?.active_sla_compliance_pct ?? (cases.length > 0 ? Math.round(((cases.length - overdueCases) / cases.length) * 100) : 100);
+  const activeSlaTrackedCount = summary
+    ? (summary.active_on_track || 0) + (summary.active_at_risk || 0) + (summary.active_overdue || 0)
+    : cases.filter((item) => !['resolved', 'closed'].includes(item.status) && Boolean(item.dueAt)).length;
+  const slaCompliancePct = activeSlaTrackedCount > 0
+    ? summary?.active_sla_compliance_pct ?? Math.round(((activeSlaTrackedCount - overdueCases) / activeSlaTrackedCount) * 100)
+    : null;
   const atRisk = overdueCases + atRiskCases;
   const healthyCount = summary?.total_assets !== undefined && summary?.at_risk_assets !== undefined
     ? Math.max(0, summary.total_assets - summary.at_risk_assets)
     : assets.filter((asset) => asset.health === 'healthy').length;
-  const healthyPct = assets.length ? Math.round((100 * healthyCount) / assets.length) : 100;
+  const healthyPct = assets.length ? Math.round((100 * healthyCount) / assets.length) : 0;
 
   // Real signal intake graph data from live database timeline
   const { signalVolume, signalLabels, totalOccurrences, peakRate, windowLabel, lastEventTime } = useMemo(() => {
@@ -982,7 +1083,7 @@ function CommandCenter({
         )}
       </div>
 
-      <section className="posture">
+      <section className="posture" data-tour-focus="command-center">
         <div className="posture-score">
           <svg viewBox="0 0 120 120">
             <circle cx="60" cy="60" r="49" className="ring-base" />
@@ -1018,7 +1119,7 @@ function CommandCenter({
             meta={overdueCases > 0 ? `${overdueCases} overdue` : atRiskCases > 0 ? `${atRiskCases} at risk` : 'on track'}
             warn={atRisk > 0}
           />
-          <PostureStat label="Assets healthy" value={`${healthyPct}%`} meta="monitored" good={healthyPct >= 70} />
+          <PostureStat label="Assets healthy" value={assets.length ? `${healthyPct}%` : '—'} meta={assets.length ? 'monitored' : 'no assets'} good={healthyPct >= 70} />
         </div>
       </section>
 
@@ -1034,18 +1135,18 @@ function CommandCenter({
         />
         <Metric
           label="SLA compliance"
-          value={`${slaCompliancePct}%`}
-          detail={overdueCases > 0 ? `${overdueCases} overdue · ${atRiskCases} at risk` : 'All active cases within target'}
-          change={overdueCases > 0 ? `${overdueCases} overdue breach in queue` : 'Dynamic preemption protecting SLAs'}
+          value={slaCompliancePct == null ? '—' : `${slaCompliancePct}%`}
+          detail={slaCompliancePct == null ? 'No active SLA-tracked cases' : overdueCases > 0 ? `${overdueCases} overdue · ${atRiskCases} at risk` : 'All active cases within target'}
+          change={slaCompliancePct == null ? 'No active SLA denominator' : overdueCases > 0 ? `${overdueCases} overdue breach in queue` : 'Based on active case deadlines'}
           icon="shield"
           tone={overdueCases > 0 ? 'critical' : 'accent'}
           helpTopic="sla_compliance"
         />
         <Metric
           label="AFDD Benchmark F1"
-          value="95.5%"
-          detail="Harmonic F1 on HVAC sensor drift"
-          change="Precision: 100% · Recall: 91.3%"
+          value="—"
+          detail="No completed evaluation selected"
+          change="Run a benchmark in Insights to record results"
           icon="activity"
           tone="success"
           helpTopic="afdd_metrics"
@@ -1053,7 +1154,7 @@ function CommandCenter({
         <Metric
           label="Monitored Assets"
           value={String(assets.length)}
-          detail="Equipment & services with RLS"
+          detail={assets.length ? 'Equipment & services in this workspace' : 'No monitored assets loaded'}
           change={`${healthyCount} healthy · ${assets.length - healthyCount} active risk`}
           icon="layers"
           tone="neutral"
@@ -1084,7 +1185,7 @@ function CommandCenter({
             </div>
             <strong>
               <Icon name="check" size={14} />
-              Live Neon Telemetry Verified
+              Verified backend intake data
             </strong>
           </div>
 
@@ -1283,7 +1384,7 @@ export function FindingsPage({
         </button>
       </div>
 
-      <section className="panel table-panel">
+      <section className="panel table-panel" data-tour-focus="findings">
         <div className="filter-bar">
           <div className="segmented">
             {(['all', 'open', 'acknowledged', 'suppressed', 'resolved'] as const).map((item) => (
@@ -1426,7 +1527,7 @@ export function CasesPage({
   cases: CaseItem[];
   findings?: Finding[];
   loading?: boolean;
-  onUpdate: (id: string, update: Partial<CaseItem>) => void;
+  onUpdate: (id: string, update: Partial<CaseItem>) => Promise<boolean>;
   onNotify: (message: string, tone?: 'success' | 'info') => void;
   onCreateNew: () => void;
   onSelectFinding?: (finding: Finding) => void;
@@ -1439,6 +1540,10 @@ export function CasesPage({
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiAction, setAiAction] = useState<'steps' | 'evidence' | null>(null);
+  const [organizationUsers, setOrganizationUsers] = useState<AuthUser[]>([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [usersError, setUsersError] = useState<string | null>(null);
+  const [ownerSaving, setOwnerSaving] = useState(false);
 
   const active = cases.filter((item) => !['resolved', 'closed'].includes(item.status));
   const visible = cases.filter((item) => {
@@ -1450,6 +1555,18 @@ export function CasesPage({
     return true;
   });
   const selected = visible.find((item) => item.id === selectedId) ?? visible[0] ?? cases[0];
+
+  useEffect(() => {
+    let active = true;
+    void api.getOrganizationUsers().then((users) => {
+      if (active) setOrganizationUsers(users);
+    }).catch((error) => {
+      if (active) setUsersError(error instanceof Error ? error.message : 'Could not load organization members.');
+    }).finally(() => {
+      if (active) setUsersLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     setAiData(null);
@@ -1563,7 +1680,7 @@ export function CasesPage({
         <Summary value="P1-P5" label="Priority scope" icon="clock" helpTopic="priority" />
       </div>
 
-      <div className="case-workspace">
+      <div className="case-workspace" data-tour-focus="cases">
         <section className="panel case-list">
           <div className="panel-tabs">
             <button className={view === 'active' ? 'is-active' : ''} onClick={() => setView('active')}>
@@ -1637,20 +1754,29 @@ export function CasesPage({
                 <span>Owner</span>
                 <select
                   aria-label="Assign case owner"
-                  value={selected.assignee}
-                  onChange={(event) => {
-                    onUpdate(selected.id, { assignee: event.target.value });
-                    onNotify(`Case assigned to ${event.target.value}`);
+                  value={selected.assigneeId ?? ''}
+                  disabled={usersLoading || ownerSaving || Boolean(usersError)}
+                  onChange={async (event) => {
+                    const assignedId = event.target.value || null;
+                    const owner = organizationUsers.find((user) => user.id === assignedId);
+                    setOwnerSaving(true);
+                    try {
+                      const saved = await onUpdate(selected.id, {
+                        assigneeId: assignedId,
+                        assignee: owner?.display_name || owner?.email || 'Unassigned',
+                      });
+                      if (saved) onNotify(assignedId ? `Case assigned to ${owner?.display_name || owner?.email}` : 'Case unassigned');
+                    } finally {
+                      setOwnerSaving(false);
+                    }
                   }}
                 >
-                  <option value="Unassigned">Unassigned</option>
-                  <option value="Lead Triage Engineer">Lead Triage Engineer</option>
-                  <option value="Sarah Chen (Principal SRE)">Sarah Chen (Principal SRE)</option>
-                  <option value="Marcus Vance (Duty Officer)">Marcus Vance (Duty Officer)</option>
-                  <option value="Elena Rostova (ML Reliability)">Elena Rostova (ML Reliability)</option>
-                  <option value="Facilities Team">Facilities Team</option>
-                  <option value="SRE Platform Team">SRE Platform Team</option>
+                  <option value="">{usersLoading ? 'Loading members…' : 'Unassigned'}</option>
+                  {organizationUsers.map((user) => (
+                    <option key={user.id} value={user.id}>{user.display_name || user.email} · {user.role}</option>
+                  ))}
                 </select>
+                {usersError && <small className="field-error" role="alert">{usersError}</small>}
               </label>
               <Property
                 icon="clock"
@@ -1864,7 +1990,7 @@ export function AssetsPage({
         }
       />
 
-      <section className="estate-overview">
+      <section className="estate-overview" data-tour-focus="assets">
         <div>
           <span className="eyebrow">ESTATE PULSE · {assets.length} ASSETS</span>
           <strong>{healthyPct}%</strong>
@@ -2168,7 +2294,7 @@ export function IncidentsPage({
         </span>
       </section>
 
-      <section className="panel table-panel">
+      <section className="panel table-panel" data-tour-focus="incidents">
         <div className="filter-bar" style={{ flexWrap: 'wrap', gap: '10px' }}>
           <div className="segmented">
             {(['all', 'Open', 'Acknowledged', 'Resolved', 'Closed'] as const).map((item) => (
@@ -2641,16 +2767,19 @@ export function RulesPage({
         }
       />
 
-      <section className="rule-summary">
+      <section className="rule-summary" data-tour-focus="rules">
         <div>
           <span>ACTIVE DETECTION</span>
           <b>{activeRules.length}</b>
           <small>rules enabled in database</small>
         </div>
         <div>
-          <span>RELIABILITY SCORE</span>
-          <b>94.0%</b>
-          <small>mean rule precision</small>
+          <span>MEAN FINDING RESOLUTION</span>
+          <b>{(() => {
+            const measured = activeRules.map((rule) => rule.effectiveness).filter((value): value is number => value !== null);
+            return measured.length ? `${(measured.reduce((sum, value) => sum + value, 0) / measured.length).toFixed(1)}%` : '—';
+          })()}</b>
+          <small>resolved findings across measured active rules</small>
         </div>
         <div>
           <span>SCHEMA AUDITING</span>
@@ -2704,7 +2833,7 @@ export function RulesPage({
                   </small>
                 </span>
                 <RuleStat label="ENGINE" value={rule.engine} />
-                <RuleStat label="EFFECTIVENESS" value={rule.effectiveness !== null ? `${rule.effectiveness}%` : 'N/A'} progress={rule.effectiveness ?? undefined} />
+                <RuleStat label="RESOLUTION RATE" value={rule.effectiveness !== null ? `${rule.effectiveness}%` : 'No findings'} progress={rule.effectiveness ?? undefined} />
                 <RuleStat label="VERSION" value={rule.version} />
                 <RuleStat label="UPDATED" value={rule.updated} />
                 <span className="rule-controls">
@@ -2799,6 +2928,7 @@ export function ReportsPage({
   cases,
   incidents = [],
   assets = [],
+  reportsTimeline = [],
   reportsData,
   onNotify,
 }: {
@@ -2807,6 +2937,7 @@ export function ReportsPage({
   incidents?: Incident[];
   assets?: Asset[];
   reportsData: SlaReportData | null;
+  reportsTimeline?: IntakeTimelinePoint[];
   onNotify: (message: string, tone?: 'success' | 'info') => void;
 }) {
   const [activeTab, setActiveTab] = useState<'operations' | 'lab'>('operations');
@@ -2947,9 +3078,26 @@ export function ReportsPage({
     return 'Minimal';
   };
 
-  // Incident & Signal trend data across 7 days
-  const trendDays = ['6d ago', '5d ago', '4d ago', '3d ago', '2d ago', 'Yesterday', 'Today'];
-  const trendCounts = [14, 19, 12, 26, 18, 22, findings.length || 15];
+  // The API supplies verified hourly finding-occurrence counts; aggregate them into UTC calendar days.
+  const { trendDays, trendCounts } = useMemo(() => {
+    const today = new Date();
+    const dayKeys = Array.from({ length: 7 }, (_, offset) => {
+      const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (6 - offset)));
+      return date.toISOString().slice(0, 10);
+    });
+    const counts = new Map(dayKeys.map((key) => [key, 0]));
+    reportsTimeline.forEach((point) => {
+      const dateKey = new Date(point.timestamp).toISOString().slice(0, 10);
+      if (counts.has(dateKey)) counts.set(dateKey, (counts.get(dateKey) || 0) + point.count);
+    });
+    const labels = dayKeys.map((key, index) => {
+      if (index === 6) return 'Today';
+      if (index === 5) return 'Yesterday';
+      return new Date(`${key}T00:00:00Z`).toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    });
+    return { trendDays: labels, trendCounts: dayKeys.map((key) => counts.get(key) || 0) };
+  }, [reportsTimeline]);
+  const p1P95 = reportsData?.sla_summary.find((row) => row.priority === 1)?.p95_resolution_minutes;
 
   return (
     <div className="page">
@@ -3005,41 +3153,45 @@ export function ReportsPage({
               tone={operationalCompliancePct < 90 ? 'critical' : operationalCompliancePct < 100 ? 'warn' : 'good'}
             />
             <Summary
-              value={reportsData?.sla_summary?.[0]?.p95_resolution_minutes ? `${reportsData.sla_summary[0].p95_resolution_minutes.toFixed(0)} min` : '48 min'}
-              label="Completed Cohort P95 MTTR"
+              value={p1P95 == null ? '—' : `${p1P95.toFixed(0)} min`}
+              label="P1 completed incident P95"
               icon="clock"
               tone="good"
             />
           </div>
 
           {/* ── Real Incident & Signal Trends Graph ──────────────────────────── */}
-          <section className="panel" style={{ padding: '22px', marginBottom: '24px' }}>
+          <section className="panel" data-tour-focus="reports" style={{ padding: '22px', marginBottom: '24px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', flexWrap: 'wrap', gap: '8px' }}>
               <div>
-                <h3 style={{ margin: 0, fontSize: '15px', color: '#0f172a' }}>Real Incident &amp; Signal Trends</h3>
+                <h3 style={{ margin: 0, fontSize: '15px', color: '#0f172a' }}>Finding Occurrences by Day</h3>
                 <small style={{ color: '#64748b', fontSize: '11px' }}>
-                  Sliding 7-day aggregation window · Units: verified operational signals / 24h
+                  Seven-day view of hourly finding-occurrence counts returned by the reports API
                 </small>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '11px', color: '#475569' }}>
                 <span><strong>Window:</strong> Past 7 Days</span>
-                <span style={{ borderLeft: '1px solid #cbd5e1', paddingLeft: '10px' }}><strong>Aggregation:</strong> Daily Sum</span>
+                <span style={{ borderLeft: '1px solid #cbd5e1', paddingLeft: '10px' }}><strong>Aggregation:</strong> Daily occurrence count · UTC</span>
               </div>
             </div>
 
-            <div style={{ height: '140px', background: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0', padding: '14px', position: 'relative' }}>
+            <div className="reports-chart" style={{ height: '158px', background: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0', padding: '8px 14px', position: 'relative' }}>
               <div style={{ position: 'absolute', top: '8px', left: '12px', fontSize: '10px', color: '#94a3b8', fontFamily: 'var(--font-mono)' }}>
-                ▲ Max: {Math.max(...trendCounts)} signals/day
+                ▲ Max: {Math.max(...trendCounts)} occurrences/day
               </div>
               <div style={{ position: 'absolute', bottom: '8px', left: '12px', fontSize: '10px', color: '#94a3b8', fontFamily: 'var(--font-mono)' }}>
-                ▼ Min: {Math.min(...trendCounts)} signals/day
+                ▼ Min: {Math.min(...trendCounts)} occurrences/day
               </div>
-              <Trend values={trendCounts} labels={trendDays} gradient="indigo" />
+              {trendCounts.some((count) => count > 0) ? (
+                <Trend values={trendCounts} labels={trendDays} gradient="indigo" showScale={false} />
+              ) : (
+                <div className="chart-empty-state">No finding occurrences were recorded during the last 7 days.</div>
+              )}
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '10px', color: '#64748b', padding: '0 4px' }}>
+            <div className="reports-chart-labels" style={{ display: 'grid', gridTemplateColumns: `repeat(${trendDays.length}, minmax(0, 1fr))`, marginTop: '8px', fontSize: '10px', color: '#64748b', padding: '0 4px' }}>
               {trendDays.map((d, i) => (
-                <span key={i}>{d}</span>
+                <span key={i} title={d}>{d}</span>
               ))}
             </div>
           </section>
@@ -3440,15 +3592,22 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
   const [importSummary, setImportSummary] = useState('');
   const [healthStatus, setHealthStatus] = useState<string>('Checking...');
   const [metrics, setMetrics] = useState<IngestMetrics | null>(null);
+  const [metricsLoading, setMetricsLoading] = useState(true);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
   const [lastTrace, setLastTrace] = useState<{ id: string; status: string; source: string; time: string } | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const fetchMetrics = async () => {
+    setMetricsLoading(true);
+    setMetricsError(null);
+    setMetrics(null);
     try {
       const m = await api.getIngestMetrics();
       setMetrics(m);
-    } catch {
-      // ignore
+    } catch (error) {
+      setMetricsError(error instanceof Error ? error.message : 'Unable to load ingestion metrics.');
+    } finally {
+      setMetricsLoading(false);
     }
   };
 
@@ -3509,36 +3668,46 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
     if (!file) return;
 
     try {
+      if (file.size > 20 * 1024 * 1024) throw new Error('Upload limit is 20 MB per file.');
       const content = await file.text();
-      let records: any[] = [];
+      let records: Array<Record<string, any>> = [];
 
       if (file.name.toLowerCase().endsWith('.json')) {
         const parsed = JSON.parse(content);
-        records = Array.isArray(parsed) ? parsed : [parsed];
+        records = (Array.isArray(parsed) ? parsed : [parsed]).map((item) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return { payload: { value: item } };
+          return item;
+        });
       } else {
-        const lines = content.split(/\r?\n/).filter((l) => l.trim());
-        if (lines.length > 1) {
-          const headers = lines[0].split(',').map((h) => h.trim());
-          records = lines.slice(1).map((line) => {
-            const vals = line.split(',');
-            const row: Record<string, any> = {};
-            headers.forEach((h, i) => {
-              row[h] = vals[i] || '';
-            });
-            return row;
-          });
-        }
+        records = parseCsvRecords(content);
       }
 
       if (records.length === 0) throw new Error('File contains no records to ingest.');
+      if (records.length > 5000) throw new Error('Upload limit is 5,000 records per file. Split the file and retry.');
 
-      await api.ingestBatch(
-        records.slice(0, 200).map((r) => ({
-          source: file.name,
-          event_type: 'batch_upload',
-          payload: typeof r === 'object' && r !== null ? r : { val: r },
-        }))
-      );
+      const chunkSize = 200;
+      for (let start = 0; start < records.length; start += chunkSize) {
+        const chunk = records.slice(start, start + chunkSize);
+        await api.ingestBatch(chunk.map((record) => {
+          let payload = record.payload;
+          if (typeof payload === 'string') {
+            try { payload = JSON.parse(payload); } catch { payload = { value: payload }; }
+          }
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+            const { source: _source, event_type: _eventType, occurred_at: _occurredAt, source_event_id: _sourceEventId, asset_id: _assetId, ...fields } = record;
+            payload = Object.keys(fields).length ? fields : { value: payload ?? record.value ?? null };
+          }
+          return {
+            source: String(record.source || file.name),
+            event_type: String(record.event_type || 'batch_upload'),
+            occurred_at: typeof record.occurred_at === 'string' ? record.occurred_at : undefined,
+            source_event_id: typeof record.source_event_id === 'string' ? record.source_event_id : undefined,
+            asset_id: typeof record.asset_id === 'string' ? record.asset_id : undefined,
+            payload: payload as Record<string, unknown>,
+          };
+        }));
+        setImportSummary(`Ingested ${Math.min(start + chunk.length, records.length)} of ${records.length} records…`);
+      }
 
       setImportSummary(`Successfully ingested ${records.length} records from ${file.name}`);
       await fetchMetrics();
@@ -3615,7 +3784,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
         </div>
       )}
 
-      <section className="ingestion-hero">
+      <section className="ingestion-hero" data-tour-focus="ingestion">
         <span>
           <i>
             <Icon name="download" />
@@ -3638,7 +3807,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
                 }}
               >
                 <span>🐘 PostgreSQL (Neon):</span>
-                <strong style={{ color: '#15803d' }}>{metrics?.database_health || 'connected'}</strong>
+                <strong style={{ color: metrics?.database_health && metrics.database_health !== 'unavailable' ? '#15803d' : '#64748b' }}>{metrics?.database_health || (metricsLoading ? 'Loading…' : 'Unavailable')}</strong>
                 {metrics?.database_latency_ms !== undefined && (
                   <span style={{ color: '#64748b', fontFamily: 'var(--font-mono)' }}>
                     ({metrics.database_latency_ms.toFixed(1)} ms ping)
@@ -3659,7 +3828,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
                 }}
               >
                 <span>⚡ Valkey (Aiven):</span>
-                <strong style={{ color: '#15803d' }}>{metrics?.cache_health || 'connected'}</strong>
+                <strong style={{ color: metrics?.cache_health && metrics.cache_health !== 'unavailable' ? '#15803d' : '#64748b' }}>{metrics?.cache_health || (metricsLoading ? 'Loading…' : 'Unavailable')}</strong>
                 {metrics?.cache_latency_ms !== undefined && (
                   <span style={{ color: '#64748b', fontFamily: 'var(--font-mono)' }}>
                     ({metrics.cache_latency_ms.toFixed(1)} ms ping)
@@ -3679,39 +3848,42 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
                   color: '#5b21b6',
                 }}
               >
-                <span>⚙️ Active Rules Correlated:</span>
-                <strong>{metrics?.rules_evaluated_count ?? 8}</strong>
+                <span>⚙️ Enabled rules available:</span>
+                <strong>{metrics?.rules_evaluated_count ?? (metricsLoading ? '…' : '—')}</strong>
               </span>
             </div>
           </span>
         </span>
         <footer>
-          <b>{metrics?.total_events ?? 0} <small>total events</small></b>
-          <b>{metrics?.processed_count ?? 0} <small>processed</small></b>
-          <b>{metrics?.failed_count ?? 0} <small>dead letters</small></b>
+          <b>{metrics?.total_events ?? (metricsLoading ? '…' : '—')} <small>total events</small></b>
+          <b>{metrics?.processed_count ?? (metricsLoading ? '…' : '—')} <small>processed</small></b>
+          <b>{metrics?.failed_count ?? (metricsLoading ? '…' : '—')} <small>dead letters</small></b>
           <b style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-            {metrics ? `${metrics.p95_latency_ms.toFixed(1)} ms` : '< 45 ms'} <small>p95 latency</small>
+            {metrics?.p95_latency_ms == null ? (metricsLoading ? '…' : '—') : `${metrics.p95_latency_ms.toFixed(1)} ms`} <small>p95 latency</small>
             <ContextualHelp topic="ingestion_latency" />
           </b>
-          <b>{metrics ? `${metrics.avg_latency_ms.toFixed(1)} ms` : '< 20 ms'} <small>avg latency</small></b>
+          <b>{metrics?.avg_latency_ms == null ? (metricsLoading ? '…' : '—') : `${metrics.avg_latency_ms.toFixed(1)} ms`} <small>avg latency</small></b>
         </footer>
       </section>
 
       {/* ── Ingestion Stage Timing Breakdown (P95 Latency Trace) ──────────── */}
       <section className="panel" style={{ marginTop: '20px', padding: '20px' }}>
         <PanelHead
-          title="Ingestion Stage Timing Breakdown (P95 Latency Trace)"
-          subtitle="Instrumented pipeline stage execution times tracing why P95 latency reflects remote cloud database roundtrips"
+          title="Ingestion Stage Timing"
+          subtitle="Per-stage timings appear when instrumented samples are available; unavailable values are left blank."
         />
+        {metricsError && <div className="callout-box" role="alert" style={{ margin: '12px 0' }}>{metricsError}</div>}
+        {metricsLoading ? <div className="skeleton-container"><div className="skeleton-row" /><div className="skeleton-row" /></div> : metrics && (
         <div className="callout-box" style={{ margin: '12px 0' }}>
-          <b>P95 Stage Trace Analysis:</b> Live instrumentation traces confirm that pipeline P95 latency (currently ~{metrics?.p95_latency_ms ? (metrics.p95_latency_ms / 1000).toFixed(2) : '4.37'}s) is concentrated in remote database storage writes over SSL to Neon PostgreSQL ({metrics?.stages_breakdown?.raw_event_storage_ms ? (metrics.stages_breakdown.raw_event_storage_ms / 1000).toFixed(2) : '3.42'}s) and transactional commit sync ({metrics?.stages_breakdown?.commit_and_cache_ms ? (metrics.stages_breakdown.commit_and_cache_ms / 1000).toFixed(2) : '0.94'}s). Memory validation and in-process rule correlation execute in sub-millisecond to single-digit milliseconds. Zero events dropped.
+          Stage timings reported by the ingestion metrics API for observed events. Values are measurements and may be unavailable when no stage trace was recorded.
         </div>
+        )}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '14px', marginTop: '16px' }}>
           <div style={{ padding: '14px', background: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
             <small style={{ fontSize: '10px', textTransform: 'uppercase', color: '#64748b', fontWeight: 700 }}>Stage 1 · In-Memory</small>
             <h4 style={{ margin: '4px 0 2px', fontSize: '13px', color: '#0f172a' }}>Payload Validation</h4>
             <b style={{ fontSize: '18px', color: '#4338ca', fontFamily: 'var(--font-mono)' }}>
-              {(metrics?.stages_breakdown?.payload_validation_ms ?? 1.2).toFixed(1)} ms
+              {metrics?.stages_breakdown?.payload_validation_ms == null ? '—' : `${metrics.stages_breakdown.payload_validation_ms.toFixed(1)} ms`}
             </b>
             <p style={{ margin: '4px 0 0', fontSize: '11px', color: '#64748b' }}>Schema verification &amp; field sanitization</p>
           </div>
@@ -3719,7 +3891,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
             <small style={{ fontSize: '10px', textTransform: 'uppercase', color: '#64748b', fontWeight: 700 }}>Stage 2 · Remote DB Storage</small>
             <h4 style={{ margin: '4px 0 2px', fontSize: '13px', color: '#0f172a' }}>Raw Event Storage (Neon)</h4>
             <b style={{ fontSize: '18px', color: '#0369a1', fontFamily: 'var(--font-mono)' }}>
-              {(metrics?.stages_breakdown?.raw_event_storage_ms ?? 3420.5).toFixed(1)} ms
+              {metrics?.stages_breakdown?.raw_event_storage_ms == null ? '—' : `${metrics.stages_breakdown.raw_event_storage_ms.toFixed(1)} ms`}
             </b>
             <p style={{ margin: '4px 0 0', fontSize: '11px', color: '#64748b' }}>SSL network roundtrip &amp; PostgreSQL write</p>
           </div>
@@ -3727,7 +3899,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
             <small style={{ fontSize: '10px', textTransform: 'uppercase', color: '#64748b', fontWeight: 700 }}>Stage 3 · Rule Engine</small>
             <h4 style={{ margin: '4px 0 2px', fontSize: '13px', color: '#0f172a' }}>Condition Correlation</h4>
             <b style={{ fontSize: '18px', color: '#15803d', fontFamily: 'var(--font-mono)' }}>
-              {(metrics?.stages_breakdown?.rule_correlation_ms ?? 4.8).toFixed(1)} ms
+              {metrics?.stages_breakdown?.rule_correlation_ms == null ? '—' : `${metrics.stages_breakdown.rule_correlation_ms.toFixed(1)} ms`}
             </b>
             <p style={{ margin: '4px 0 0', fontSize: '11px', color: '#64748b' }}>Evaluated against active rules &amp; thresholds</p>
           </div>
@@ -3735,7 +3907,7 @@ export function IngestionPage({ onNotify }: { onNotify: (message: string, tone?:
             <small style={{ fontSize: '10px', textTransform: 'uppercase', color: '#64748b', fontWeight: 700 }}>Stage 4 · Durability Sync</small>
             <h4 style={{ margin: '4px 0 2px', fontSize: '13px', color: '#0f172a' }}>Commit &amp; Cache Invalidate</h4>
             <b style={{ fontSize: '18px', color: '#b45309', fontFamily: 'var(--font-mono)' }}>
-              {(metrics?.stages_breakdown?.commit_and_cache_ms ?? 943.5).toFixed(1)} ms
+              {metrics?.stages_breakdown?.commit_and_cache_ms == null ? '—' : `${metrics.stages_breakdown.commit_and_cache_ms.toFixed(1)} ms`}
             </b>
             <p style={{ margin: '4px 0 0', fontSize: '11px', color: '#64748b' }}>DB transaction commit &amp; Valkey sync</p>
           </div>
@@ -3790,15 +3962,19 @@ export function IntegrationsPage({
 }) {
   const [bridges, setBridges] = useState<IntegrationBridge[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, string>>({});
 
   const fetchIntegrations = async () => {
+    setLoading(true);
+    setLoadError(null);
+    setBridges([]);
     try {
       const data = await api.getIntegrations();
       setBridges(data);
-    } catch {
-      // fallback
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'Unable to load integration status.');
     } finally {
       setLoading(false);
     }
@@ -3843,6 +4019,9 @@ export function IntegrationsPage({
         }
       />
 
+      {loading && <div className="integration-grid" aria-label="Loading integrations"><div className="skeleton-card" /><div className="skeleton-card" /><div className="skeleton-card" /></div>}
+      {loadError && <div className="callout-box" role="alert" style={{ marginBottom: '16px' }}>{loadError} <button className="text-button" onClick={() => void fetchIntegrations()}>Retry</button></div>}
+
       <section className="explanation">
         <i>
           <Icon name="layers" />
@@ -3861,7 +4040,7 @@ export function IntegrationsPage({
         <span>Verified Live Bridges</span>
         <small>· Hardware gateways and live webhook ingestion</small>
       </div>
-      <div className="integration-grid">
+      <div className="integration-grid" data-tour-focus="integrations">
         {liveBridges.map((bridge) => (
           <article key={bridge.id}>
             <header>
@@ -4047,7 +4226,7 @@ export function SettingsPage({
         }
       />
 
-      <div className="settings-layout">
+      <div className="settings-layout" data-tour-focus="settings">
         <aside className="settings-nav">
           <button
             className={activeTab === 'identity' ? 'is-active' : ''}
@@ -4684,10 +4863,12 @@ function Trend({
   values,
   gradient,
   labels,
+  showScale = true,
 }: {
   values: number[];
   gradient: 'indigo' | 'teal';
   labels?: string[];
+  showScale?: boolean;
 }) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const safeValues = values.length >= 2 ? values : (values.length === 1 ? [values[0], values[0]] : [0, 0]);
@@ -4706,15 +4887,11 @@ function Trend({
 
   return (
     <div className={`trend ${gradient}`} style={{ position: 'relative' }} role="region" aria-label="Signal Volume Trend Graph">
-      <div style={{ position: 'absolute', top: '2px', left: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>
-        {max} signals
-      </div>
-      <div style={{ position: 'absolute', bottom: '2px', left: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>
-        0
-      </div>
-      <div style={{ position: 'absolute', bottom: '2px', right: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>
-        Now
-      </div>
+      {showScale && <>
+        <div style={{ position: 'absolute', top: '2px', left: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>{max} signals</div>
+        <div style={{ position: 'absolute', bottom: '2px', left: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>0</div>
+        <div style={{ position: 'absolute', bottom: '2px', right: '4px', fontSize: '9px', color: '#94a3b8', zIndex: 4, fontFamily: 'var(--font-mono)' }}>Now</div>
+      </>}
       <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label={`Signal volume trend from 0 to ${max} signals`}>
         <defs>
           <linearGradient id={`trend-grad-${gradient}`} x1="0" y1="0" x2="0" y2="1">

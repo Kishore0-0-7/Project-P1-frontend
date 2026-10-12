@@ -172,7 +172,7 @@ describe('ReportsPage Component', () => {
     // Verify Active Investigations & SLA Compliance KPIs
     expect(screen.getByText('Active investigations')).toBeInTheDocument();
     expect(screen.getByText('02')).toBeInTheDocument();
-    expect(screen.getByText('Real Incident & Signal Trends')).toBeInTheDocument();
+    expect(screen.getByText('Finding Occurrences by Day')).toBeInTheDocument();
 
     // Verify Scope distinction callout
     expect(screen.getByText(/Operational Scope Distinction:/i)).toBeInTheDocument();
@@ -219,7 +219,7 @@ describe('ReportsPage Component', () => {
     const opsTabBtn = screen.getByRole('button', { name: /real operations & sla reliability/i });
     fireEvent.click(opsTabBtn);
 
-    expect(screen.getByText('Real Incident & Signal Trends')).toBeInTheDocument();
+    expect(screen.getByText('Finding Occurrences by Day')).toBeInTheDocument();
   });
 
   it('supports CSV report export', () => {
@@ -262,7 +262,7 @@ describe('IngestionPage Component', () => {
     await waitFor(() => {
       expect(screen.getByText(/14.2 ms ping/i)).toBeInTheDocument();
       expect(screen.getByText(/2.3 ms ping/i)).toBeInTheDocument();
-      expect(screen.getByText(/active rules correlated:/i)).toBeInTheDocument();
+      expect(screen.getByText(/enabled rules available:/i)).toBeInTheDocument();
     });
 
     // Check Total events and P95 latency
@@ -270,7 +270,7 @@ describe('IngestionPage Component', () => {
     expect(screen.getByText('4370.2 ms')).toBeInTheDocument();
 
     // Check Stage Timing Breakdown cards tracing 4.37s P95
-    expect(screen.getByText('Ingestion Stage Timing Breakdown (P95 Latency Trace)')).toBeInTheDocument();
+    expect(screen.getByText('Ingestion Stage Timing')).toBeInTheDocument();
     expect(screen.getByText('Payload Validation')).toBeInTheDocument();
     expect(screen.getByText('1.4 ms')).toBeInTheDocument();
     expect(screen.getByText('Raw Event Storage (Neon)')).toBeInTheDocument();

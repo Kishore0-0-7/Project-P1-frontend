@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { PageId } from '../types';
+import { Icon } from './Icon';
 
 export interface HelpMenuProps {
+  page?: PageId;
   onStartTour: () => void;
   onNavigate: (view: PageId) => void;
 }
@@ -169,9 +171,69 @@ const TASK_GUIDES: Guide[] = [
       },
     ],
   },
+  {
+    id: 'review-assets', title: 'Review Asset Health', icon: '▦', category: 'Assets', targetView: 'assets',
+    plainEnglishSummary: 'Compare an asset’s business criticality with its current operational risk and telemetry state.',
+    steps: [
+      { step: 1, action: 'Search or filter the asset list', location: 'Assets -> Filter bar', detail: 'Narrow by site, equipment type, or health state.' },
+      { step: 2, action: 'Compare health and criticality', location: 'Asset overview and cards', detail: 'Risk describes current condition; criticality describes business importance.' },
+      { step: 3, action: 'Inspect linked operational work', location: 'Asset card -> Signals and cases', detail: 'Use linked findings and cases to decide what needs investigation.' },
+    ],
+  },
+  {
+    id: 'trace-incidents', title: 'Trace a Source Incident', icon: '◉', category: 'Source Incidents', targetView: 'incidents',
+    plainEnglishSummary: 'Review incoming incidents and follow their relationship to findings and cases.',
+    steps: [
+      { step: 1, action: 'Review incident priority and source', location: 'Source Incidents table', detail: 'Confirm where the incident came from and what priority it has.' },
+      { step: 2, action: 'Inspect linked finding evidence', location: 'Incident row -> linked signal', detail: 'Open a linked finding to review the evidence behind the signal.' },
+      { step: 3, action: 'Escalate coordinated work', location: 'Incident actions', detail: 'Create a case when the issue needs an owner and tracked resolution.' },
+    ],
+  },
+  {
+    id: 'manage-rules', title: 'Manage Detection Rules', icon: '⌘', category: 'Rules & Automations', targetView: 'rules',
+    plainEnglishSummary: 'Review rule definitions, lifecycle state, and measured effectiveness before changing detection behavior.',
+    steps: [
+      { step: 1, action: 'Filter rules by lifecycle state', location: 'Rules -> Filter bar', detail: 'Find active, draft, or paused rules.' },
+      { step: 2, action: 'Inspect the rule definition', location: 'Rule row -> Details', detail: 'Check the engine and conditions before making a change.' },
+      { step: 3, action: 'Preview before publishing', location: 'Rule actions -> Dry run', detail: 'Review the sample matches and stage before enabling a rule.' },
+    ],
+  },
+  {
+    id: 'read-insights', title: 'Read Reliability Insights', icon: '▤', category: 'Insights & AI Reports', targetView: 'reports',
+    plainEnglishSummary: 'Read time-bounded incident outcomes and finding occurrence trends, with the data window and aggregation shown beside each chart.',
+    steps: [
+      { step: 1, action: 'Check the occurrence trend', location: 'Insights -> Trend graph', detail: 'The graph counts finding occurrences returned by the API for each UTC day.' },
+      { step: 2, action: 'Compare closed incident SLA results', location: 'Insights -> SLA table', detail: 'Rows group closed incidents by priority for the selected reporting window.' },
+      { step: 3, action: 'Separate live results from simulations', location: 'Operations and Benchmark Lab tabs', detail: 'Simulation results are what-if benchmarks and are not live production outcomes.' },
+    ],
+  },
+  {
+    id: 'check-ingestion', title: 'Check Telemetry Intake', icon: '⇧', category: 'Ingestion Health', targetView: 'ingestion',
+    plainEnglishSummary: 'Verify API health and event processing metrics before relying on downstream findings.',
+    steps: [
+      { step: 1, action: 'Wait for health and metrics to load', location: 'Ingestion Health -> Pipeline status', detail: 'Unavailable metrics are shown as unavailable rather than a zero or sample value.' },
+      { step: 2, action: 'Send a test event deliberately', location: 'Page actions -> Send test telemetry', detail: 'A valid test creates a real event in the workspace.' },
+      { step: 3, action: 'Confirm event processing', location: 'Latest trace and counters', detail: 'Check its status and verify the event counters update.' },
+    ],
+  },
+  {
+    id: 'secure-workspace', title: 'Review Workspace Security', icon: '◇', category: 'Settings & Security', targetView: 'settings',
+    plainEnglishSummary: 'Confirm your signed-in identity and use the account security controls available to your role.',
+    steps: [
+      { step: 1, action: 'Check identity and organization', location: 'Settings -> Identity', detail: 'Verify the active account, organization, and assigned role.' },
+      { step: 2, action: 'Update account credentials', location: 'Settings -> Password', detail: 'Use the password form and never share credentials in support chat.' },
+      { step: 3, action: 'Sign out from shared devices', location: 'Profile -> Sign out', detail: 'Signing out revokes the current session.' },
+    ],
+  },
 ];
 
-export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) => {
+const PAGE_NAMES: Record<PageId, string> = {
+  'command-center': 'Command Center', findings: 'Signal Intelligence', cases: 'Casework', assets: 'Assets',
+  incidents: 'Source Incidents', rules: 'Rules & Automations', reports: 'Insights & AI Reports',
+  ingestion: 'Ingestion Health', integrations: 'Integrations', settings: 'Settings & Security',
+};
+
+export const HelpMenu: React.FC<HelpMenuProps> = ({ page, onStartTour, onNavigate }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedGuide, setSelectedGuide] = useState<Guide | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -186,6 +248,17 @@ export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) =
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    if (!selectedGuide) return;
+    document.body.setAttribute('data-help-target', selectedGuide.targetView);
+    const target = document.querySelector(`[data-tour-focus="${selectedGuide.targetView}"]`);
+    target?.classList.add('guide-focus-highlight');
+    return () => {
+      document.body.removeAttribute('data-help-target');
+      target?.classList.remove('guide-focus-highlight');
+    };
+  }, [selectedGuide]);
+
   return (
     <div className="help-menu-container" ref={menuRef}>
       <button
@@ -195,15 +268,15 @@ export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) =
         aria-haspopup="true"
         title="Help & Operations Guides"
       >
-        <span className="help-icon">?</span>
+        <span className="help-icon"><Icon name="book" size={16} /></span>
         <span className="help-label">Help &amp; Guides</span>
       </button>
 
       {isOpen && (
         <div className="help-dropdown" role="menu">
           <div className="help-dropdown-header">
-            <b>Operations Manager Guides</b>
-            <small>Step-by-step task instructions</small>
+            <b>{page ? `${PAGE_NAMES[page]} guide` : 'Operations Guides'}</b>
+            <small>Page-specific workflow help</small>
           </div>
 
           <div className="help-dropdown-section">
@@ -218,7 +291,7 @@ export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) =
               <span className="item-icon">🎓</span>
               <div className="item-text">
                 <b>Replay Platform Tour</b>
-                <small>4-step walkthrough of core workflows</small>
+                <small>Walkthrough of all 10 workspace pages</small>
               </div>
             </button>
           </div>
@@ -226,10 +299,11 @@ export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) =
           <div className="help-dropdown-divider" />
 
           <div className="help-dropdown-section">
-            {TASK_GUIDES.map((guide) => (
+            {TASK_GUIDES.filter((guide) => !page || guide.targetView === page).map((guide) => (
               <button
                 key={guide.id}
                 className="help-menu-item"
+                aria-current={page === guide.targetView ? 'page' : undefined}
                 onClick={() => {
                   setIsOpen(false);
                   setSelectedGuide(guide);
@@ -248,7 +322,7 @@ export const HelpMenu: React.FC<HelpMenuProps> = ({ onStartTour, onNavigate }) =
       )}
 
       {selectedGuide && (
-        <div className="guide-modal-overlay" role="dialog" aria-modal="true">
+        <div className="guide-modal-overlay" role="dialog" aria-modal="false">
           <div className="guide-modal">
             <div className="guide-modal-header">
               <div className="guide-modal-badge">{selectedGuide.category}</div>

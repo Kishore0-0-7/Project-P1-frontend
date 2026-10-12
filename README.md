@@ -1,35 +1,35 @@
 # OpsTriage Console
 
-React/Vite frontend for the OpsTriage workflow. It ships with a local demo dataset so the full operator journey can be exercised before the API is available. Browser-local changes persist in `localStorage` under the `opstriage.demo.*` namespace.
+React and Vite frontend for the OpsTriage operational workflow. The application signs users in through the FastAPI service and loads workspace data from its authenticated API.
 
 ## Run
 
 ```bash
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:5173`. Start the backend separately and configure its database and Gemini settings as described in [the backend README](../backend/README.md).
 
-## Data and API
+## API configuration
 
-The UI is deliberately marked as demo-backed. Creating or updating findings, cases, incidents, rules, settings, integration toggles, and report exports operate on local browser data; file import validates CSV/JSON locally but does not ingest it into the database. No real Slack, ServiceNow, Jira, or Prometheus requests are made.
+Set `VITE_API_URL` to the backend API root, including `/api/v1`; `.env.example` uses `http://localhost:8001/api/v1`. The API client otherwise defaults to `http://localhost:8081/api/v1`. `VITE_ORG_ID` is a development default used by organization-scoped requests; authenticated deployments should use the organization associated with the signed-in account and must not rely on the sample value.
 
-To use the live FastAPI service, copy `frontend/.env.example` to `frontend/.env`. The current example targets `http://localhost:8001/api/v1` and includes the development organization ID. When `VITE_API_URL` is set, findings, cases, assets, incidents, rules, record creation, status mutations, rule toggles, refresh, and JSON ingestion use the backend; when it is absent, the UI remains an explicit local demo. Live request failures are surfaced instead of silently replacing live responses with seed data.
+The frontend stores the access token, refresh token, and signed-in profile in browser local storage. Workspace requests use the bearer token. Backend authorization and tenant isolation remain enforced by the API. AI assistance, including support chat, requires Gemini to be enabled and configured on the backend.
 
-The API client supports bearer tokens stored under `opstriage.auth.access_token`; login UI and organization switching are still separate work. Production deployments must provide an authenticated token and must not rely on the development `VITE_ORG_ID`.
+Help & Guides opens workflow instructions and the replayable platform tour. The tour can focus the current page while keeping the guide available. Support chat answers product-usage questions and does not load workspace records or perform actions. Integration cards and local import previews should not be taken as proof of a live third-party connection; verify delivery through the backend integration/ingestion endpoints.
 
-Screen state and page composition are in `src/App.tsx`; reusable presentation styles live in `src/styles.css` and `src/pages.css`; seed records are in `src/data/mockData.ts`; types are centralized in `src/types.ts`.
-
-## Screen inventory
+## Main screens
 
 - Command Center — operational health, active signal queue, workload, latency, and system posture
-- Signal Intelligence — triage, acknowledgement, assignment, evidence, and finding-to-case conversion
-- Casework — human investigation workflow and ownership
-- Assets — cross-domain HVAC/IT estate health
-- Rules & Automations — rule lifecycle, version, and safety controls
-- Reports — SLA, detection, and outcome-feedback metrics
-- Integrations — delivery destinations and ingestion surface
-- Source Incidents — incident lifecycle and source-to-finding context
-- Ingestion Health — source status and CSV/JSON validation
-- Settings — local workspace, SLA, access, audit, and notification preferences
+- Signal Intelligence — triage, evidence, acknowledgement, and finding-to-case workflow
+- Casework — investigation ownership and resolution
+- Assets and Source Incidents — equipment registry and incident lifecycle
+- Rules & Automations — detection rule lifecycle and safety controls
+- Insights & AI Reports — SLA, detection, and outcome metrics
+- Ingestion Health — event intake and pipeline status
+- Integrations — configured ingress and delivery bridges
+- Settings & Security — account and workspace controls
+
+Screen composition is in `src/App.tsx`; reusable styles are in `src/styles.css` and `src/pages.css`; API requests are in `src/lib/api.ts`.

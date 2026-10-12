@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { HelpMenu } from './HelpMenu';
 import { ContextualHelp } from './ContextualHelp';
+import type { PageId } from '../types';
 
 describe('HelpMenu Component', () => {
   it('opens help menu and displays all 4 task guides plus tour replay', () => {
@@ -45,6 +46,15 @@ describe('HelpMenu Component', () => {
     const goBtn = screen.getByRole('button', { name: /go to signal intelligence/i });
     fireEvent.click(goBtn);
     expect(handleNavigate).toHaveBeenCalledWith('findings');
+  });
+
+  it('shows the guide for the current page and highlights its matching section', () => {
+    const page: PageId = 'reports';
+    render(<HelpMenu page={page} onStartTour={vi.fn()} onNavigate={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /help & guides/i }));
+    expect(screen.getByText('Read Reliability Insights')).toBeInTheDocument();
+    expect(screen.queryByText('Investigate an Alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /read reliability insights/i })).toHaveAttribute('aria-current', 'page');
   });
 });
 

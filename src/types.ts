@@ -43,6 +43,7 @@ export interface CaseItem {
   status: CaseStatus;
   priority: number;
   assignee: string;
+  assigneeId?: string | null;
   due: string;
   dueAt?: string;
   isOverdue?: boolean;
@@ -301,8 +302,8 @@ export interface IngestMetrics {
   processed_count: number;
   pending_count: number;
   failed_count: number;
-  p95_latency_ms: number;
-  avg_latency_ms: number;
+  p95_latency_ms: number | null;
+  avg_latency_ms: number | null;
   sources_breakdown: Record<string, number>;
   recent_errors: Array<{
     id: string;

@@ -35,6 +35,7 @@ import type {
 
 const API_BASE = (import.meta.env.VITE_API_URL?.replace(/\/$/, '') || 'http://localhost:8081/api/v1');
 const DEFAULT_ORG_ID = import.meta.env.VITE_ORG_ID || 'a0000000-0000-0000-0000-000000000001';
+const currentOrgId = () => getCurrentUser()?.org_id || DEFAULT_ORG_ID;
 
 const ACCESS_TOKEN_KEY = 'opstriage.auth.access_token';
 const REFRESH_TOKEN_KEY = 'opstriage.auth.refresh_token';
@@ -100,9 +101,9 @@ export function onAuthExpired(callback: () => void): void {
 
 let isRefreshing = false;
 
-async function request<T>(path: string, init: RequestInit = {}, isRetry = false): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, isRetry = false, timeoutMs = 30000): Promise<T> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 12000);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   const headers = new Headers(init.headers);
   headers.set('Accept', 'application/json');
 
@@ -140,7 +141,7 @@ async function request<T>(path: string, init: RequestInit = {}, isRetry = false)
             saveAuthSession(newSession);
             isRefreshing = false;
             // Retry original request with fresh access token
-            return await request<T>(path, init, true);
+            return await request<T>(path, init, true, timeoutMs);
           }
         } catch {
           // Refresh failed
@@ -165,7 +166,13 @@ async function request<T>(path: string, init: RequestInit = {}, isRetry = false)
       if (typeof parsed === 'object' && parsed !== null) {
         if ('detail' in parsed) {
           const d = (parsed as { detail: unknown }).detail;
-          detail = Array.isArray(d) ? d.map((e) => e.msg || JSON.stringify(e)).join(', ') : String(d);
+          if (Array.isArray(d)) {
+            detail = d.map((e) => e.msg || JSON.stringify(e)).join(', ');
+          } else if (typeof d === 'object' && d !== null && 'message' in d) {
+            detail = String((d as { message: unknown }).message);
+          } else {
+            detail = String(d);
+          }
         } else if ('message' in parsed) {
           detail = String((parsed as { message: unknown }).message);
         }
@@ -174,6 +181,11 @@ async function request<T>(path: string, init: RequestInit = {}, isRetry = false)
     }
 
     return parsed as T;
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new ApiError(408, `Request timed out after ${Math.round(timeoutMs / 1000)} seconds. Please retry.`);
+    }
+    throw error;
   } finally {
     window.clearTimeout(timer);
   }
@@ -297,6 +309,7 @@ function mapCase(c: any): CaseItem {
     status: c.status || 'open',
     priority: Number(c.priority || 3),
     assignee,
+    assigneeId: c.assigned_to || null,
     due: dueText,
     dueAt: c.due_at || undefined,
     isOverdue,
@@ -422,7 +435,7 @@ function mapRule(r: any): Rule {
 
   const engineName = r.engine
     ? r.engine.charAt(0).toUpperCase() + r.engine.slice(1).replace('_', ' ')
-    : 'Threshold';
+    : 'Unconfigured';
 
   return {
     id: r.id,
@@ -430,7 +443,7 @@ function mapRule(r: any): Rule {
     name: r.name,
     category: r.description || 'System · Automated',
     engine: engineName,
-    version: r.active_version_id ? `v${String(r.active_version_id).slice(0, 4)}` : 'Draft',
+    version: r.version !== undefined && r.version !== null ? `v${Number(r.version)}` : 'Draft',
     status,
     effectiveness: r.effectiveness !== undefined && r.effectiveness !== null ? Number(r.effectiveness) : null,
     findings: r.findings !== undefined ? Number(r.findings) : 0,
@@ -482,6 +495,10 @@ export const api = {
     const res = await request<AuthUser>('/auth/me');
     window.localStorage.setItem(USER_PROFILE_KEY, JSON.stringify(res));
     return res;
+  },
+
+  async getOrganizationUsers(): Promise<AuthUser[]> {
+    return request<AuthUser[]>('/auth/users');
   },
 
   async changePassword(oldPassword: string, newPassword: string): Promise<{ message: string }> {
@@ -573,19 +590,13 @@ export const api = {
 
   async updateCase(
     id: string,
-    updates: { status?: string; priority?: number; assigned_to?: string; resolution_notes?: string }
+    updates: { status?: string; priority?: number; assigned_to?: string | null; resolution_notes?: string }
   ): Promise<CaseItem> {
     const body: Record<string, any> = {};
     if (updates.status !== undefined) body.status = updates.status;
     if (updates.priority !== undefined) body.priority = updates.priority;
     if (updates.resolution_notes !== undefined) body.resolution_notes = updates.resolution_notes;
-    if (updates.assigned_to !== undefined) {
-      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(updates.assigned_to)) {
-        body.assigned_to = updates.assigned_to;
-      } else if (updates.assigned_to === 'Unassigned' || !updates.assigned_to) {
-        body.assigned_to = null;
-      }
-    }
+    if (updates.assigned_to !== undefined) body.assigned_to = updates.assigned_to;
     const row = await request<any>(`/cases/${id}${query({})}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
@@ -742,6 +753,8 @@ export const api = {
     source: string;
     event_type: string;
     occurred_at?: string;
+    source_event_id?: string;
+    asset_id?: string;
     payload: Record<string, unknown>;
   }>) {
     return request<any>(`/ingest/events/batch${query({})}`, {
@@ -751,6 +764,8 @@ export const api = {
           source: e.source,
           event_type: e.event_type,
           occurred_at: e.occurred_at || new Date().toISOString(),
+          source_event_id: e.source_event_id,
+          asset_id: e.asset_id,
           payload: e.payload,
         })),
       }),
@@ -808,27 +823,27 @@ export const api = {
   },
 
   // Ingest Metrics & Traceability
-  async getIngestMetrics(orgId = DEFAULT_ORG_ID): Promise<IngestMetrics> {
+  async getIngestMetrics(orgId = currentOrgId()): Promise<IngestMetrics> {
     return request<IngestMetrics>(`/ingest/metrics?org_id=${encodeURIComponent(orgId)}`);
   },
 
-  async getSourceEvent(findingId: string, orgId = DEFAULT_ORG_ID): Promise<SourceEventDetail> {
+  async getSourceEvent(findingId: string, orgId = currentOrgId()): Promise<SourceEventDetail> {
     return request<SourceEventDetail>(`/findings/${encodeURIComponent(findingId)}/source-event?org_id=${encodeURIComponent(orgId)}`);
   },
 
   // Integrations & Delivery checks
-  async getIntegrations(orgId = DEFAULT_ORG_ID): Promise<IntegrationBridge[]> {
+  async getIntegrations(orgId = currentOrgId()): Promise<IntegrationBridge[]> {
     return request<IntegrationBridge[]>(`/integrations?org_id=${encodeURIComponent(orgId)}`);
   },
 
-  async testIntegration(provider: string, orgId = DEFAULT_ORG_ID): Promise<any> {
+  async testIntegration(provider: string, orgId = currentOrgId()): Promise<any> {
     return request<any>(`/integrations/${encodeURIComponent(provider)}/test?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
     });
   },
 
   // Rule Testing
-  async testRule(ruleId: string, payload: Record<string, any>, orgId = DEFAULT_ORG_ID): Promise<any> {
+  async testRule(ruleId: string, payload: Record<string, any>, orgId = currentOrgId()): Promise<any> {
     return request<any>(`/rules/${encodeURIComponent(ruleId)}/test?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -841,35 +856,35 @@ export const api = {
   },
 
   // Operational KPI Summary
-  async getOperationalSummary(orgId = DEFAULT_ORG_ID): Promise<OperationalSummary> {
+  async getOperationalSummary(orgId = currentOrgId()): Promise<OperationalSummary> {
     return request<OperationalSummary>(`/reports/operational-summary?org_id=${encodeURIComponent(orgId)}`);
   },
 
   // System Posture Score & Breakdown
-  async getSystemPosture(orgId = DEFAULT_ORG_ID): Promise<PostureReport> {
+  async getSystemPosture(orgId = currentOrgId()): Promise<PostureReport> {
     return request<PostureReport>(`/reports/posture?org_id=${encodeURIComponent(orgId)}`);
   },
 
   // Production Gemini AI Assistant
-  async explainSignal(findingId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+  async explainSignal(findingId: string, orgId = currentOrgId()): Promise<AIAssistanceResponse> {
     return request<AIAssistanceResponse>(`/ai/explain-signal?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
       body: JSON.stringify({ finding_id: findingId }),
-    });
+    }, false, 70000);
   },
 
-  async investigateCase(caseId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+  async investigateCase(caseId: string, orgId = currentOrgId()): Promise<AIAssistanceResponse> {
     return request<AIAssistanceResponse>(`/ai/investigate-case?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
       body: JSON.stringify({ case_id: caseId }),
-    });
+    }, false, 70000);
   },
 
-  async summarizeEvidence(caseId: string, orgId = DEFAULT_ORG_ID): Promise<AIAssistanceResponse> {
+  async summarizeEvidence(caseId: string, orgId = currentOrgId()): Promise<AIAssistanceResponse> {
     return request<AIAssistanceResponse>(`/ai/summarize-evidence?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
       body: JSON.stringify({ case_id: caseId }),
-    });
+    }, false, 70000);
   },
 
   async askFollowUp(
@@ -877,7 +892,7 @@ export const api = {
     contextId: string,
     question: string,
     history: FollowUpMessage[] = [],
-    orgId = DEFAULT_ORG_ID
+    orgId = currentOrgId()
   ): Promise<FollowUpResponse> {
     return request<FollowUpResponse>(`/ai/follow-up?org_id=${encodeURIComponent(orgId)}`, {
       method: 'POST',
@@ -887,6 +902,13 @@ export const api = {
         question,
         conversation_history: history,
       }),
-    });
+    }, false, 70000);
+  },
+
+  async askSupportChat(question: string, history: FollowUpMessage[] = []): Promise<{ answer: string; model_used: string }> {
+    return request<{ answer: string; model_used: string }>('/ai/support-chat', {
+      method: 'POST',
+      body: JSON.stringify({ question, conversation_history: history }),
+    }, false, 70000);
   },
 };
